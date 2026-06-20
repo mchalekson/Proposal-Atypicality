@@ -1,0 +1,4 @@
+
+# Large data files
+*.parquet
+~.docx
