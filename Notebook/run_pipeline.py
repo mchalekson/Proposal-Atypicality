@@ -153,25 +153,12 @@ def classify_reference(ref_text, parsed_journal_raw=None, parsed_doi=None):
         ref_type = 'unclassified'
     return ref_type, ';'.join(labels)
 
-def parse_anystyle_citation(reference_text):
-    proc = subprocess.run(
-        [ANYSTYLE_BIN, 'parse', '-f', 'json'],
-        input=reference_text, text=True, capture_output=True, timeout=45
-    )
-    if proc.returncode != 0:
-        return {}, proc.stderr[:500] or f'anystyle exited {proc.returncode}'
-    payload = json.loads(proc.stdout)
-    if isinstance(payload, list) and payload:
-        item = payload[0]
-    elif isinstance(payload, dict):
-        item = payload
-    else:
-        return {}, 'empty_anystyle_response'
+def anystyle_item_to_parsed(item):
     journal = item.get('container-title') or item.get('journal') or item.get('collection-title')
     title = item.get('title')
     if isinstance(title, list): title = ' '.join(map(str, title))
     if isinstance(journal, list): journal = ' '.join(map(str, journal))
-    parsed = {
+    return {
         'parsed_title': title if title else pd.NA,
         'parsed_journal_raw': journal if journal else pd.NA,
         'parsed_year': item.get('date') or item.get('year') or pd.NA,
@@ -180,7 +167,36 @@ def parse_anystyle_citation(reference_text):
         'parsed_issue': item.get('issue') or pd.NA,
         'parsed_pages': item.get('pages') or item.get('page') or pd.NA,
     }
-    return parsed, ''
+
+def batch_anystyle(reference_texts, tmp_dir):
+    """Parse all references in one AnyStyle call. Returns list of parsed dicts."""
+    import tempfile
+    # AnyStyle requires one reference per line; newlines within a ref must be stripped
+    cleaned = [re.sub(r'\s+', ' ', t).strip() for t in reference_texts]
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', dir=tmp_dir, delete=False, encoding='utf-8') as f:
+        f.write('\n'.join(cleaned))
+        tmp_in = f.name
+    tmp_out = tmp_in.replace('.txt', '.json')
+    try:
+        proc = subprocess.run(
+            [ANYSTYLE_BIN, '--stdout', '-f', 'json', 'parse', tmp_in],
+            capture_output=True, text=True, timeout=300
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return [{}] * len(reference_texts)
+        results = json.loads(proc.stdout)
+        if not isinstance(results, list):
+            return [{}] * len(reference_texts)
+        # Pad/truncate to match input length
+        while len(results) < len(reference_texts):
+            results.append({})
+        return results[:len(reference_texts)]
+    except Exception:
+        return [{}] * len(reference_texts)
+    finally:
+        for p in [tmp_in, tmp_out]:
+            try: os.unlink(p)
+            except: pass
 
 def clean_candidate_span(span):
     span = str(span)
@@ -257,9 +273,41 @@ if PARSED_REFS_PATH.exists():
     print(f'Loading cached parsed refs from {PARSED_REFS_PATH}')
     parsed_refs = pd.read_parquet(PARSED_REFS_PATH)
 else:
+    import tempfile
+    tmp_dir = tempfile.mkdtemp()
+    BATCH_SIZE = 5000
+    texts = raw_refs['reference_text'].tolist()
+    all_anystyle = []
+    if USE_ANYSTYLE and anystyle_active:
+        print(f'Running AnyStyle in batches of {BATCH_SIZE} on {len(texts):,} references...')
+        for i in tqdm(range(0, len(texts), BATCH_SIZE), desc='AnyStyle batches'):
+            batch = texts[i:i+BATCH_SIZE]
+            all_anystyle.extend(batch_anystyle(batch, tmp_dir))
+        print(f'AnyStyle done. Got {len(all_anystyle)} results.')
+    else:
+        all_anystyle = [{}] * len(texts)
+
     parsed_rows = []
-    for row in tqdm(raw_refs.itertuples(index=False), total=len(raw_refs), desc='Parsing refs (AnyStyle+fallback)'):
-        parsed = parse_reference(row.reference_text)
+    for idx, row in enumerate(raw_refs.itertuples(index=False)):
+        item = all_anystyle[idx] if idx < len(all_anystyle) else {}
+        if item:
+            parsed = anystyle_item_to_parsed(item)
+            parsed['parser_used'] = 'anystyle' if pd.notna(parsed.get('parsed_journal_raw')) else 'anystyle_no_journal'
+            parsed['parse_success'] = pd.notna(parsed.get('parsed_journal_raw'))
+            parsed['parse_error'] = ''
+        else:
+            parsed = {'parsed_title': pd.NA, 'parsed_journal_raw': pd.NA, 'parsed_year': pd.NA,
+                      'parsed_doi': pd.NA, 'parsed_volume': pd.NA, 'parsed_issue': pd.NA,
+                      'parsed_pages': pd.NA, 'parser_used': 'none', 'parse_success': False, 'parse_error': ''}
+
+        # Regex fallback if anystyle didn't get a journal
+        if not pd.notna(parsed.get('parsed_journal_raw')) and ALLOW_REGEX_FALLBACK:
+            candidates = regex_journal_candidates(row.reference_text)
+            if candidates:
+                parsed['parsed_journal_raw'] = candidates[0]
+                parsed['parser_used'] = 'regex_fallback'
+                parsed['parse_success'] = True
+
         dois  = sorted(set(normalize_doi(x) for x in DOI_RE.findall(row.reference_text)))
         dois  = [x for x in dois if x.startswith('10.')]
         pmids  = sorted(set(PMID_RE.findall(row.reference_text)))
@@ -276,7 +324,11 @@ else:
             'is_paper_candidate': ref_type in ['likely_paper', 'unknown_with_year'],
             'has_doi': bool(dois), **parsed,
         })
+
     parsed_refs = pd.DataFrame(parsed_rows)
+    for col in ['parsed_volume', 'parsed_issue', 'parsed_pages', 'parsed_year']:
+        if col in parsed_refs.columns:
+            parsed_refs[col] = parsed_refs[col].astype(str).where(parsed_refs[col].notna(), pd.NA)
     parsed_refs.to_parquet(PARSED_REFS_PATH, index=False)
     failures = parsed_refs[~parsed_refs['parse_success'] | parsed_refs['parsed_journal_raw'].isna()].copy()
     failures.to_parquet(PARSING_FAILURES_PATH, index=False)
@@ -318,33 +370,169 @@ ABBREV = {
 }
 STOPWORDS = {'of', 'the', 'and', 'for', 'in', 'on', 'to', 'a', 'an', '&'}
 KNOWN_ALIASES = {
+    # PNAS variants — authority has "Proceedings of the National Academy of Sciences"
     'nejm': 'new england journal medicine',
     'new engl j med': 'new england journal medicine',
     'n engl j med': 'new england journal medicine',
-    'pnas': 'proceedings national academy sciences united states america',
-    'proc natl acad sci u s a': 'proceedings national academy sciences united states america',
-    'proc natl acad sci usa': 'proceedings national academy sciences united states america',
+    'pnas': 'proceedings national academy sciences',
+    'proc natl acad sci u s a': 'proceedings national academy sciences',
+    'proc natl acad sci usa': 'proceedings national academy sciences',
+    'natl acad sci u s a': 'proceedings national academy sciences',
+    'proc natl acad sci': 'proceedings national academy sciences',
+    'proc. natl. acad. sci. u. s. a': 'proceedings national academy sciences',
+    'natl. acad. sci. u. s. a': 'proceedings national academy sciences',
+    'proceedings national academy sciences united states america': 'proceedings national academy sciences',
+    # Annals
+    'ann intern med': 'annals internal medicine',
+    'ann rheum dis': 'annals rheumatic diseases',
+    'ann surg': 'annals surgery',
+    'ann neurol': 'annals neurology',
+    # Infectious disease
+    'j virol': 'journal virology',
+    'clin infect dis': 'clinical infectious diseases',
+    'j infect dis': 'journal infectious diseases',
+    # Cardiology/pulmonary
+    'chest': 'chest',
+    # Botany
+    'new phytol': 'new phytologist',
+    'front plant sci': 'frontiers plant science',
+    # Internal medicine
+    'j intern med': 'journal internal medicine',
+    # Oncology
+    'acta oncol': 'acta oncologica',
+    # Chemistry
+    'chem. soc. rev': 'chemical society reviews',
+    'chem soc rev': 'chemical society reviews',
+    'acs catal': 'acs catalysis',
+    'j med chem': 'journal medicinal chemistry',
+    'metab eng': 'metabolic engineering',
+    # Fertility
+    'fertil steril': 'fertility sterility',
+    # Pathology
+    'am j pathol': 'american journal pathology',
+    # Microbiology
+    'microb cell fact': 'microbial cell factories',
+    # Biochemistry
+    'biochim biophys acta': 'biochimica biophysica acta',
+    'free radic biol med': 'free radical biology medicine',
+    # Physiology (truncated variants)
+    'am j physiol endocrinol metab': 'american journal physiology endocrinology metabolism',
+    'am j physiol renal physiol': 'american journal physiology renal physiology',
+    'am j physiol cell physiol': 'american journal physiology cell physiology',
+    'am j physiol heart circ physiol': 'american journal physiology heart circulatory physiology',
+    # Frontiers (with location suffix stripped)
+    'front endocrinol lausanne': 'frontiers endocrinology',
+    'front endocrinol (lausanne': 'frontiers endocrinology',
+    # Obstetrics/gynecology
+    'am j obstet gynecol': 'american journal obstetrics gynecology',
+    # Annual reviews
+    'annu rev biochem': 'annual review biochemistry',
+    # Botany
+    'j exp bot': 'journal experimental botany',
+    # Obesity (truncated)
+    'int j obes (lond': 'international journal obesity',
+    'int j obes': 'international journal obesity',
+    # Optics
+    'opt. express': 'optics express',
+    # Computational chemistry
+    'j. chem. theory comput': 'journal chemical theory computation',
+    'j chem theory comput': 'journal chemical theory computation',
+    # Nursing
+    'j adv nurs': 'journal advanced nursing',
+    # Sports medicine
+    'med sci sports exerc': 'medicine science sports exercise',
+    # Infectious disease
+    'infect immun': 'infection immunity',
+    'plos pathog': 'plos pathogens',
+    # Internal medicine
+    'arch intern med': 'archives internal medicine',
+    # Neurology
+    'neurobiol dis': 'neurobiology disease',
+    # Nature reviews disease primers
+    'nat rev dis primers': 'nature reviews disease primers',
+    # Synthetic biology
+    'acs synth biol': 'acs synthetic biology',
+    # Danish medical journal
+    'dan med j': 'danish medical journal',
+    # Video methods
+    'j vis exp': 'journal visualized experiments',
+    # Angew chem
+    'chem. int. ed': 'angewandte chemie international edition',
+    'engl. j. med': 'new england journal medicine',
+    'natl. acad. sci': 'proceedings national academy sciences',
+    # JCI
     'jci': 'journal clinical investigation',
+    'j clin invest': 'journal clinical investigation',
+    # Chemistry
+    'j. am. chem. soc': 'journal american chemical society',
+    'j am chem soc': 'journal american chemical society',
+    'jacs': 'journal american chemical society',
+    'angew chem int ed': 'angewandte chemie international edition',
+    'chem. int. ed': 'angewandte chemie international edition',
+    'angew. chem. int. ed': 'angewandte chemie international edition',
+    # Frontiers journals
+    'front immunol': 'frontiers immunology',
+    'front microbiol': 'frontiers microbiology',
+    'front physiol': 'frontiers physiology',
+    'front neurosci': 'frontiers neuroscience',
+    'front oncol': 'frontiers oncology',
+    'front genet': 'frontiers genetics',
+    'front cell dev biol': 'frontiers cell developmental biology',
+    'front endocrinol': 'frontiers endocrinology',
+    # Scandinavian/public health
+    'scand j public health': 'scandinavian journal public health',
+    # Biochemistry
+    'biochim biophys acta': 'biochimica biophysica acta',
+    'bba': 'biochimica biophysica acta',
+    # Bone/nephrology
+    'j bone miner res': 'journal bone mineral research',
+    'j am soc nephrol': 'journal american society nephrology',
+    'jasn': 'journal american society nephrology',
+    # Nature reviews
+    'nat rev drug discov': 'nature reviews drug discovery',
+    'nat rev cancer': 'nature reviews cancer',
+    'nat rev immunol': 'nature reviews immunology',
+    'nat rev genet': 'nature reviews genetics',
+    'nat rev mol cell biol': 'nature reviews molecular cell biology',
+    'nat rev neurosci': 'nature reviews neuroscience',
+    'nat rev cardiol': 'nature reviews cardiology',
+    # Reproduction/endocrinology
+    'hum reprod': 'human reproduction',
+    'am j physiol endocrinol metab': 'american journal physiology endocrinology metabolism',
+    'diabet med': 'diabetic medicine',
+    'endocr rev': 'endocrine reviews',
+    # Genetics/molecular
+    'hum mol genet': 'human molecular genetics',
+    'am j hum genet': 'american journal human genetics',
+    'nat struct mol biol': 'nature structural molecular biology',
+    # Vascular
+    'arterioscler thromb vasc biol': 'arteriosclerosis thrombosis vascular biology',
+    'j cereb blood flow metab': 'journal cerebral blood flow metabolism',
+    # Cardiology
+    'j am heart assoc': 'journal american heart association',
+    'eur heart j': 'european heart journal',
+    # Development
+    'dev cell': 'developmental cell',
+    # Other
     'bmj': 'british medical journal',
-    'am. j. hum. genet': 'american journal of human genetics',
-    'am j hum genet': 'american journal of human genetics',
+    'am. j. hum. genet': 'american journal human genetics',
     'acta neurol scand': 'acta neurologica scandinavica',
     'glob med genet': 'global medical genetics',
-    'j gen intern med': 'journal of general internal medicine',
+    'j gen intern med': 'journal general internal medicine',
     'nanoen': 'nano energy',
-    'sens diagn': 'sensors & diagnostics',
+    'sens diagn': 'sensors diagnostics',
     'molcel': 'mol cell',
     'celrep': 'cell reports',
-    'j bone jt infect': 'journal of bone and joint infection',
-    'jbji': 'journal of bone and joint infection',
-    'lipids health dis': 'lipids in health and disease',
+    'j bone jt infect': 'journal bone joint infection',
+    'jbji': 'journal bone joint infection',
+    'lipids health dis': 'lipids health disease',
     'nat protoc': 'nature protocols',
     'cmet': 'cell metabolism',
-    'jnucmat': 'journal of nuclear materials',
-    'omtn': 'molecular therapy: nucleic acids',
-    'res in phys': 'results in physics',
-    'biotechnol bioeng': 'biotechnology and bioengineering',
-    'agrformet': 'agricultural and forest meteorology',
+    'jnucmat': 'journal nuclear materials',
+    'omtn': 'molecular therapy nucleic acids',
+    'res in phys': 'results physics',
+    'biotechnol bioeng': 'biotechnology bioengineering',
+    'agrformet': 'agricultural forest meteorology',
     'sci adv': 'science advances',
 }
 
@@ -476,7 +664,9 @@ for row in authority.itertuples(index=False):
     for variant in journal_variants(row.journal_name):
         add_alias(row.journal_id, variant, 'generated_variant', row.authority_source)
 
-authority_aliases = pd.DataFrame(alias_rows).dropna(subset=['alias_key']).drop_duplicates(['journal_id', 'alias_key'])
+alias_cols = ['journal_id', 'alias', 'alias_norm', 'alias_key', 'alias_type', 'authority_source']
+authority_aliases = pd.DataFrame(alias_rows, columns=alias_cols) if alias_rows else pd.DataFrame(columns=alias_cols)
+authority_aliases = authority_aliases.dropna(subset=['alias_key']).drop_duplicates(['journal_id', 'alias_key'])
 authority_aliases.to_parquet(JOURNAL_AUTHORITY_ALIASES_PATH, index=False)
 
 variant_to_ids = defaultdict(list)
@@ -574,6 +764,10 @@ def match_candidate_to_authority(candidate):
             second_score = scored[1][0] if len(scored) > 1 else 0.0
             score_gap = best_score - second_score
             if (best_score >= 0.93 and score_gap >= 0.04) or (best_score >= 0.98 and score_gap >= 0.01):
+                # Reject fuzzy matches to very short journal names (likely garbage)
+                if len(best_row.journal_key) < 5:
+                    return {'match_method': 'unmatched_candidate', 'journal_id': pd.NA,
+                            'journal_name': pd.NA, 'journal_raw': candidate, 'match_score': np.nan}
                 return {'match_method': 'candidate_fuzzy_authority', 'journal_id': best_row.journal_id,
                         'journal_name': best_row.journal_name, 'journal_raw': candidate, 'match_score': float(best_score)}
 
@@ -708,7 +902,7 @@ proposal_pairs.to_parquet(PROPOSAL_JOURNAL_PAIRS_PATH, index=False)
 proposal_pairs.to_csv(CSV_DIR / 'proposal_openalex_source_pairs.csv', index=False)
 
 print(f'proposal source pairs: {len(proposal_pairs):,}')
-print(f'proposals with ≥1 pair: {proposal_pairs[[ID_COL, YEAR_COL]].drop_duplicates().shape[0]:,}')
+print(f'proposals with ≥1 pair: {proposal_pairs[[ID_COL, YEAR_COL]].drop_duplicates().shape[0]:,}' if len(proposal_pairs) else 'proposals with ≥1 pair: 0')
 print('\nDone. Output files:')
 for f in sorted(OUTPUT_DIR.rglob('*')) + sorted(CSV_DIR.rglob('*')):
     if f.is_file():
